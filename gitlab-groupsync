@@ -1,0 +1,212 @@
+#!/bin/bash
+# The gitlab-rails runner is not happy when used after the shebang
+exec ${GITLAB_RAILS:-/usr/bin/gitlab-rails} runner "$(tail -n+$((LINENO+1)) "$0")"
+
+=begin
+Synchronize group membership in GitLab with that of the system
+
+We do so in two ways:
+- Listen for user_create events from GitLab and act on the created user
+- Schedule synchronization on all users with a username available on the system
+
+The synchronization is governed by a mapping that specifies the roles of the
+members of a system group in a GitLab group.
+=end
+
+# 10 => Guest access
+# 20 => Reporter access
+# 30 => Developer access
+# 40 => Maintainer access
+# 50 => Owner access
+MAPPING = {
+    'GitLab Group Name':    { 'wheel': 50, 'users': 10 },
+    'Another GitLab Group': { 'wheel': 40, 'developers': 30 }
+  }.freeze
+INTERVAL = 3600   # Seconds between synchronization runs
+PORT     = 61714  # Gitla
+
+
+require 'etc'
+require 'json'
+require 'webrick'
+
+
+# Set a filename and lower logging level to obtain a useful log
+$logger = WEBrick::Log.new nil, WEBrick::Log::WARN
+
+
+# Log messages and return them
+def tee_log(**msgs)
+  msgs.each { |level, msg| $logger.public_send(level, msg) }
+  msgs.values.join("\n") + "\n"
+end
+
+
+# A mapping of all relevant system groups to their members
+def system_group_members
+  members = {}
+  MAPPING.each_value do |levels|
+    levels.each_key do |group|
+      next if members.key? group
+      members[group] =
+        begin
+          Etc.getgrnam(group.to_s).mem
+        rescue
+          $logger.warn "Missing system group: #{group}"
+          []
+        end
+    end
+  end
+  members
+end
+
+
+# Whether a name is a username on the system
+def known_user?(name)
+  begin
+    Etc.getpwnam name
+    true
+  rescue
+    false
+  end
+end
+
+
+# Synchronize group membership for a given username
+def sync_user(system_groups, name)
+  response = tee_log(debug: "Synchronizing '#{name}'")
+
+  # Determine the GitLab user ID and the system groups the user is a member of
+  user_id = User.find_by(username: name)&.id
+  unless user_id
+    response += tee_log(warn: "Missing GitLab user: #{name}")
+    return response
+  end
+  system_groups = system_groups.keys.filter { |g| system_groups[g].include? name }
+
+  MAPPING.each do |gitlab_group, levels|
+    group = Group.find_by name: gitlab_group
+    unless group
+      response += tee_log(warn: "Missing GitLab group: #{gitlab_group}")
+      next
+    end
+    member = group.members.find_by user_id: user_id
+    levels = levels.slice(*system_groups)
+    if member
+      if levels.empty?
+        # The user should not be in the GitLab group
+        member.destroy
+        response += tee_log(info: "Removed user '#{name}' from GitLab group '#{gitlab_group}'")
+      end
+    else
+      unless levels.empty?
+        # The user should be in the GitLab group
+        level = levels.values.max
+        group.add_user(user_id, level)
+        response += tee_log(info: "Added user '#{name}' to GitLab group '#{gitlab_group}' with access level #{level}")
+      end
+    end
+  end
+  response
+end
+
+
+# Reset the current server from the GitLab hooks and optionally register once
+def gitlab_hook_reset(register: false)
+  url = "http://localhost:#{PORT}/user"
+  # We cannot use .find_each because we may modify the database
+  SystemHook.all.each do |hook|
+    hook.destroy if hook.url == url
+  end
+  if register
+    SystemHook.new(
+        url: url,
+        push_events: false,
+        tag_push_events: false,
+        merge_requests_events: false,
+        repository_update_events: false,
+        #enable_ssl_verification: false
+      ).save
+  end
+end
+
+
+
+# Prepare the HTTP server
+begin
+  server = WEBrick::HTTPServer.new BindAddress: 'localhost', Port: PORT, Logger: $logger
+rescue Errno::EADDRINUSE, Errno::EADDRNOTAVAIL
+  puts 'The port is already in use, maybe the program is already running'
+  require 'net/http'
+  puts Net::HTTP.get('localhost', '/sync', PORT)
+  exit 0
+end
+
+server.mount_proc '/quit' do server.shutdown end
+
+server.mount_proc '/status' do |_request, response|
+  response.body = $sync_all_thread.status ? 'ok' : 'fail'
+end
+
+server.mount_proc '/sync' do |_request, response|
+  begin
+    $sync_all_thread.run
+    response.body = 'Synchronizing on request'
+  rescue
+    response.body = 'Failed to synchronize'
+  end
+end
+
+server.mount_proc '/user' do |request, response|
+  begin
+    raise unless request.request_method == 'POST'
+    request_body = JSON.parse(request.body)
+    raise unless request_body['event_name'].in? %w[user_create user_rename]
+    name = request_body['username']
+    if known_user? name
+      response.body = sync_user(system_group_members, name)
+    else
+      response.body = "Unknown user: #{name}"
+      $logger.debug "Not synchronizing '#{name}' (unknown user)"
+    end
+  rescue
+    response.body = 'Unhandled request'
+  end
+end
+
+puts "Request localhost:#{PORT}/quit to quit"
+puts "Request localhost:#{PORT}/status to see the daemon status"
+puts "Request localhost:#{PORT}/sync to force immediate synchronization"
+
+# Start the HTTP server and a background process for synchronizing all users
+WEBrick::Daemon.start do
+  Process.setproctitle "gitlab-groupsync #{INTERVAL}s :#{PORT}"
+
+  $sync_all_thread = Thread.new do
+    loop do
+      groups = system_group_members
+      # A sufficiently large Rails connection pool is required
+      # See: /etc/gitlab/gitlab.rb
+      Rails.application.executor.wrap do
+        User.active.each do |user|
+          sync_user(groups, user.username) if known_user? user.username
+        end
+      end
+      sleep INTERVAL
+    end
+  rescue => exception
+    $logger.error exception.message
+    raise
+  end
+
+  begin
+    gitlab_hook_reset register: true
+    server.start
+  ensure
+    gitlab_hook_reset
+    server.shutdown
+  end
+end
+
+
+# vim: filetype=ruby

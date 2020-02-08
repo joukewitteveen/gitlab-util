@@ -1,0 +1,10 @@
+Utilities for integrating GitLab into a development environment
+
+gitlab-pivot
+Allows users to interface repositories managed by gitlab as their own system
+user, bypassing the GitLab authentication system using certificates.
+
+gitlab-groupsync
+Allows group membership in GitLab to be governed by membership of system groups.
+
+Both tools assume that a user has the same username in GitLab and on the system.

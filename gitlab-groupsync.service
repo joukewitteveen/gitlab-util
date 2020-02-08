@@ -1,0 +1,13 @@
+[Unit]
+Description=Group synchronization service for GitLab
+After=gitlab-runsvdir.service
+BindsTo=gitlab-runsvdir.service
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/gitlab-groupsync
+ExecStop=/usr/bin/curl -s localhost:61714/quit
+#Restart=always
+
+[Install]
+WantedBy=gitlab-runsvdir.service
