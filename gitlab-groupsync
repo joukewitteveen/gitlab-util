@@ -118,16 +118,14 @@ def gitlab_hook_reset(register: false)
   SystemHook.all.each do |hook|
     hook.destroy if hook.url == url
   end
-  if register
-    SystemHook.new(
-        url: url,
-        push_events: false,
-        tag_push_events: false,
-        merge_requests_events: false,
-        repository_update_events: false,
-        #enable_ssl_verification: false
-      ).save
-  end
+  SystemHook.new(
+      url: url,
+      push_events: false,
+      tag_push_events: false,
+      merge_requests_events: false,
+      repository_update_events: false,
+      #enable_ssl_verification: false
+    ).save if register
 end
 
 
@@ -145,7 +143,7 @@ end
 server.mount_proc '/quit' do server.shutdown end
 
 server.mount_proc '/status' do |_request, response|
-  response.body = $sync_all_thread.status ? 'ok' : 'fail'
+  response.body = $sync_all_thread.alive? ? 'ok' : 'fail'
 end
 
 server.mount_proc '/sync' do |_request, response|
@@ -174,38 +172,39 @@ server.mount_proc '/user' do |request, response|
   end
 end
 
-puts "Request localhost:#{PORT}/quit to quit"
-puts "Request localhost:#{PORT}/status to see the daemon status"
-puts "Request localhost:#{PORT}/sync to force immediate synchronization"
+
+# Daemonize when not already managed as a systemd daemon
+if ENV['SYSTEMD_EXEC_PID']&.to_i != Process.pid
+  puts "Request localhost:#{PORT}/quit to quit"
+  puts "Request localhost:#{PORT}/status to see the daemon status"
+  puts "Request localhost:#{PORT}/sync to force immediate synchronization"
+  Process.daemon
+end
+Process.setproctitle "gitlab-groupsync #{INTERVAL}s :#{PORT}"
 
 # Start the HTTP server and a background process for synchronizing all users
-WEBrick::Daemon.start do
-  Process.setproctitle "gitlab-groupsync #{INTERVAL}s :#{PORT}"
-
-  $sync_all_thread = Thread.new do
-    loop do
-      groups = system_group_members
-      # A sufficiently large Rails connection pool is required
-      # See: /etc/gitlab/gitlab.rb
-      Rails.application.executor.wrap do
-        User.active.each do |user|
-          sync_user(groups, user.username) if known_user? user.username
-        end
+$sync_all_thread = Thread.new do
+  loop do
+    groups = system_group_members
+    # A sufficiently large database connection pool is required
+    Rails.application.executor.wrap do
+      User.active.each do |user|
+        sync_user(groups, user.username) if known_user? user.username
       end
-      sleep INTERVAL
     end
-  rescue => exception
-    $logger.error exception.message
-    raise
+    sleep INTERVAL
   end
+rescue => exception
+  $logger.error exception.message
+  raise
+end
 
-  begin
-    gitlab_hook_reset register: true
-    server.start
-  ensure
-    gitlab_hook_reset
-    server.shutdown
-  end
+begin
+  gitlab_hook_reset register: true
+  server.start
+ensure
+  gitlab_hook_reset
+  server.shutdown
 end
 
 

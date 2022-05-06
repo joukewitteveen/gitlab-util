@@ -4,9 +4,9 @@ After=gitlab-runsvdir.service
 BindsTo=gitlab-runsvdir.service
 
 [Service]
-Type=forking
 ExecStart=/usr/local/bin/gitlab-groupsync
-ExecStop=/usr/bin/curl -s localhost:61714/quit
+ExecStop=-/usr/bin/curl -s localhost:61714/quit
+ExecReload=/usr/bin/curl -s localhost:61714/sync
 #Restart=always
 
 [Install]
