@@ -102,7 +102,7 @@ def sync_user(system_groups, name)
       unless levels.empty?
         # The user should be in the GitLab group
         level = levels.values.max
-        group.add_user(user_id, level)
+        group.add_member(user_id, level)
         response += tee_log(info: "Added user '#{name}' to GitLab group '#{gitlab_group}' with access level #{level}")
       end
     end
